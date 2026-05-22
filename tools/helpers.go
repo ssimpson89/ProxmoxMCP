@@ -14,16 +14,26 @@ import (
 	px "github.com/luthermonson/go-proxmox"
 )
 
-const taskTimeout = 5 * time.Minute
+const (
+	taskTimeout       = 5 * time.Minute
+	backupTaskTimeout = 2 * time.Hour
+)
 
 var (
-	nodeNameRe    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
-	snapNameRe    = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{0,39}$`)
-	storageNameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]*$`)
+	nodeNameRe     = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+	snapNameRe     = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{0,39}$`)
+	storageNameRe  = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]*$`)
+	ciDriveRe      = regexp.MustCompile(`^(ide|sata|scsi)\d+$`)
+	safeFilenameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+	qemuDiskRe     = regexp.MustCompile(`^(scsi|virtio|ide|sata|efidisk)\d+$`)
+	lxcDiskRe      = regexp.MustCompile(`^(rootfs|mp\d+)$`)
+	diskSizeRe     = regexp.MustCompile(`^\+?\d+[TGMK]?$`)
 
 	sensitiveConfigKeys = map[string]bool{
 		"cipassword": true,
 		"sshkeys":    true,
+		"args":       true,
+		"cicustom":   true,
 	}
 )
 
@@ -205,8 +215,53 @@ func toolError(msg string) server.ToolHandlerFunc {
 }
 
 func waitForTask(ctx context.Context, task *px.Task) error {
+	return waitForTaskWithTimeout(ctx, task, taskTimeout)
+}
+
+func waitForTaskWithTimeout(ctx context.Context, task *px.Task, timeout time.Duration) error {
 	if task == nil {
 		return nil
 	}
-	return task.Wait(ctx, px.DefaultWaitInterval, taskTimeout)
+	if err := task.Wait(ctx, px.DefaultWaitInterval, timeout); err != nil {
+		return err
+	}
+	if task.IsFailed {
+		return fmt.Errorf("task failed: %s", task.ExitStatus)
+	}
+	return nil
+}
+
+func optionalInt(req mcp.CallToolRequest, name string) (int, error) {
+	args := req.GetArguments()
+	val, ok := args[name]
+	if !ok {
+		return 0, nil
+	}
+	switch v := val.(type) {
+	case float64:
+		return int(v), nil
+	case int:
+		return v, nil
+	default:
+		return 0, fmt.Errorf("parameter %q must be a number", name)
+	}
+}
+
+func optionalIntDefault(req mcp.CallToolRequest, name string, defaultVal int) int {
+	args := req.GetArguments()
+	if _, ok := args[name]; !ok {
+		return defaultVal
+	}
+	v, _ := optionalInt(req, name)
+	if v == 0 {
+		return defaultVal
+	}
+	return v
+}
+
+func optionalStr(req mcp.CallToolRequest, key, defaultVal string) string {
+	if v, ok := req.GetArguments()[key].(string); ok && v != "" {
+		return v
+	}
+	return defaultVal
 }

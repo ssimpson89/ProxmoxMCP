@@ -15,4 +15,6 @@ func Register(s *server.MCPServer, client *px.Client, cfg *config.Config) {
 	registerLxcTools(s, client)
 	registerStorageTools(s, client)
 	registerTemplateTools(s, client)
+	registerCloudInitTools(s, client)
+	registerApplianceTools(s, client)
 }

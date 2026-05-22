@@ -101,6 +101,37 @@ func registerQemuTools(s *server.MCPServer, client *px.Client, cfg *config.Confi
 		mcp.WithString("name", mcp.Required(), mcp.Description("Snapshot name to rollback to")),
 	), qemuSnapshotRollbackHandler(client))
 
+	s.AddTool(mcp.NewTool("qemu_snapshot_delete",
+		mcp.WithDescription("Delete a snapshot from a virtual machine. DESTRUCTIVE: the snapshot data is permanently removed."),
+		mcp.WithString("node", mcp.Required(), mcp.Description("Node name")),
+		mcp.WithNumber("vmid", mcp.Required(), mcp.Description("VM ID")),
+		mcp.WithString("name", mcp.Required(), mcp.Description("Snapshot name to delete")),
+	), qemuSnapshotDeleteHandler(client))
+
+	s.AddTool(mcp.NewTool("qemu_resize_disk",
+		mcp.WithDescription("Resize a VM disk. Can only increase size, not shrink. Size format: +10G (add 10GB), 50G (set to 50GB)."),
+		mcp.WithString("node", mcp.Required(), mcp.Description("Node name")),
+		mcp.WithNumber("vmid", mcp.Required(), mcp.Description("VM ID")),
+		mcp.WithString("disk", mcp.Required(), mcp.Description("Disk name (e.g. scsi0, virtio0, ide0)")),
+		mcp.WithString("size", mcp.Required(), mcp.Description("New size or size increment (e.g. +10G, 50G)")),
+	), qemuResizeDiskHandler(client))
+
+	s.AddTool(mcp.NewTool("qemu_migrate",
+		mcp.WithDescription("Migrate a VM to a different node. Supports online (live) migration and offline migration."),
+		mcp.WithString("node", mcp.Required(), mcp.Description("Current node name")),
+		mcp.WithNumber("vmid", mcp.Required(), mcp.Description("VM ID")),
+		mcp.WithString("target", mcp.Required(), mcp.Description("Target node name")),
+		mcp.WithBoolean("online", mcp.Description("Live migration (default: true if VM is running)")),
+		mcp.WithString("targetstorage", mcp.Description("Target storage for local disks (optional, required if disks are on local storage)")),
+		mcp.WithBoolean("with_local_disks", mcp.Description("Migrate local disks to target storage (default: false)")),
+	), qemuMigrateHandler(client))
+
+	s.AddTool(mcp.NewTool("qemu_agent_info",
+		mcp.WithDescription("Get guest OS information, hostname, and network interfaces from a running VM via the QEMU Guest Agent. Requires the guest agent to be installed and running."),
+		mcp.WithString("node", mcp.Required(), mcp.Description("Node name")),
+		mcp.WithNumber("vmid", mcp.Required(), mcp.Description("VM ID")),
+	), qemuAgentInfoHandler(client))
+
 	execHandler := toolError("qemu_exec is disabled. Set PROXMOX_ALLOW_EXEC=true to enable command execution.")
 	if cfg.AllowExec {
 		execHandler = qemuExecHandler(client)
@@ -367,5 +398,177 @@ func qemuExecHandler(client *px.Client) server.ToolHandlerFunc {
 		}
 
 		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+func qemuSnapshotDeleteHandler(client *px.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		vm, _, vmid, err := withVM(client, ctx, req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		snapName, err := requiredSnapName(req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		task, err := vm.DeleteSnapshot(ctx, snapName)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to delete snapshot: %v", err)), nil
+		}
+		if err := waitForTask(ctx, task); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Snapshot deletion failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Successfully deleted snapshot %q from VM %d", snapName, vmid)), nil
+	}
+}
+
+func qemuResizeDiskHandler(client *px.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		vm, _, vmid, err := withVM(client, ctx, req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		disk, err := req.RequireString("disk")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if !qemuDiskRe.MatchString(disk) {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid disk name %q: must be scsiN, virtioN, ideN, sataN, or efidiskN", disk)), nil
+		}
+		size, err := req.RequireString("size")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if !diskSizeRe.MatchString(size) {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid size %q: must be like +10G, 50G, 100M", size)), nil
+		}
+
+		task, err := vm.ResizeDisk(ctx, disk, size)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to resize disk %s on VM %d: %v", disk, vmid, err)), nil
+		}
+		if err := waitForTask(ctx, task); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Disk resize failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Successfully resized disk %s to %s on VM %d", disk, size, vmid)), nil
+	}
+}
+
+func qemuMigrateHandler(client *px.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		vm, _, vmid, err := withVM(client, ctx, req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		target, err := req.RequireString("target")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if !nodeNameRe.MatchString(target) {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid target node name %q", target)), nil
+		}
+
+		opts := &px.VirtualMachineMigrateOptions{
+			Target:        target,
+			TargetStorage: optionalStr(req, "targetstorage", ""),
+		}
+
+		// IntOrBool(false) is dropped by omitempty in the library's JSON tags,
+		// so we can only explicitly send true. When omitted, Proxmox defaults
+		// to online migration for running VMs and offline for stopped VMs.
+		args := req.GetArguments()
+		if v, ok := args["online"].(bool); ok && v {
+			opts.Online = px.IntOrBool(true)
+		}
+		if v, ok := args["with_local_disks"].(bool); ok && v {
+			opts.WithLocalDisks = px.IntOrBool(true)
+		}
+
+		task, err := vm.Migrate(ctx, opts)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to migrate VM %d: %v", vmid, err)), nil
+		}
+		if err := waitForTask(ctx, task); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Migration failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Successfully migrated VM %d to node %s", vmid, target)), nil
+	}
+}
+
+func qemuAgentInfoHandler(client *px.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		vm, _, vmid, err := withVM(client, ctx, req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		type ifaceInfo struct {
+			Name            string `json:"name"`
+			HardwareAddress string `json:"hardware_address"`
+			IPAddresses     []struct {
+				Type    string `json:"type"`
+				Address string `json:"address"`
+				Prefix  int    `json:"prefix"`
+			} `json:"ip_addresses,omitempty"`
+		}
+
+		type agentInfo struct {
+			VMID       int         `json:"vmid"`
+			Hostname   string      `json:"hostname,omitempty"`
+			OSName     string      `json:"os_name,omitempty"`
+			OSVersion  string      `json:"os_version,omitempty"`
+			OSPretty   string      `json:"os_pretty_name,omitempty"`
+			Kernel     string      `json:"kernel,omitempty"`
+			Machine    string      `json:"machine,omitempty"`
+			Interfaces []ifaceInfo `json:"interfaces,omitempty"`
+		}
+
+		info := agentInfo{VMID: vmid}
+
+		hostname, err := vm.AgentGetHostName(ctx)
+		if err == nil {
+			info.Hostname = hostname
+		}
+
+		osInfo, err := vm.AgentOsInfo(ctx)
+		if err == nil && osInfo != nil {
+			info.OSName = osInfo.Name
+			info.OSVersion = osInfo.Version
+			info.OSPretty = osInfo.PrettyName
+			info.Kernel = osInfo.KernelRelease
+			info.Machine = osInfo.Machine
+		}
+
+		ifaces, err := vm.AgentGetNetworkIFaces(ctx)
+		if err == nil {
+			for _, iface := range ifaces {
+				fi := ifaceInfo{
+					Name:            iface.Name,
+					HardwareAddress: iface.HardwareAddress,
+				}
+				for _, ip := range iface.IPAddresses {
+					fi.IPAddresses = append(fi.IPAddresses, struct {
+						Type    string `json:"type"`
+						Address string `json:"address"`
+						Prefix  int    `json:"prefix"`
+					}{
+						Type:    ip.IPAddressType,
+						Address: ip.IPAddress,
+						Prefix:  ip.Prefix,
+					})
+				}
+				info.Interfaces = append(info.Interfaces, fi)
+			}
+		}
+
+		if info.Hostname == "" && info.OSName == "" && info.Interfaces == nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Guest agent on VM %d returned no data; ensure the agent is installed and running", vmid)), nil
+		}
+
+		return marshalResult(info)
 	}
 }

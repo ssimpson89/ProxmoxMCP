@@ -19,6 +19,16 @@ func registerNodeTools(s *server.MCPServer, client *px.Client) {
 		mcp.WithDescription("Get detailed status for a specific node including CPU, memory, kernel version, and PVE version"),
 		mcp.WithString("node", mcp.Required(), mcp.Description("Node name")),
 	), nodeStatusHandler(client))
+
+	s.AddTool(mcp.NewTool("node_backup",
+		mcp.WithDescription("Create a backup (vzdump) of a VM or container. The backup is stored on the specified storage pool."),
+		mcp.WithString("node", mcp.Required(), mcp.Description("Node the VM/container is on")),
+		mcp.WithNumber("vmid", mcp.Required(), mcp.Description("VM or container ID to back up")),
+		mcp.WithString("storage", mcp.Required(), mcp.Description("Storage pool for the backup (must support 'backup' content type)")),
+		mcp.WithString("mode", mcp.Description("Backup mode: snapshot (default, no downtime), suspend (brief pause), stop (full stop during backup)")),
+		mcp.WithString("compress", mcp.Description("Compression: zstd (default, best), lzo (fast), gzip, or 0 (none)")),
+		mcp.WithString("notes_template", mcp.Description("Notes template for the backup (e.g. '{{guestname}} backup')")),
+	), nodeBackupHandler(client))
 }
 
 func nodeListHandler(client *px.Client) server.ToolHandlerFunc {
@@ -114,5 +124,62 @@ func nodeStatusHandler(client *px.Client) server.ToolHandlerFunc {
 		}
 
 		return marshalResult(detail)
+	}
+}
+
+var (
+	validBackupModes       = map[string]bool{"snapshot": true, "suspend": true, "stop": true}
+	validBackupCompression = map[string]bool{"zstd": true, "lzo": true, "gzip": true, "0": true}
+)
+
+func nodeBackupHandler(client *px.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeName, err := requiredNode(req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		vmid, err := requiredVMID(req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		storageName, err := requiredStorageName(req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		mode := optionalStr(req, "mode", "snapshot")
+		if !validBackupModes[mode] {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid backup mode %q: must be snapshot, suspend, or stop", mode)), nil
+		}
+		compress := optionalStr(req, "compress", "zstd")
+		if !validBackupCompression[compress] {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid compression %q: must be zstd, lzo, gzip, or 0", compress)), nil
+		}
+
+		node, err := client.Node(ctx, nodeName)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to get node %q: %v", nodeName, err)), nil
+		}
+
+		opts := &px.VirtualMachineBackupOptions{
+			VMID:     uint64(vmid),
+			Storage:  storageName,
+			Mode:     px.VirtualMachineBackupMode(mode),
+			Compress: px.VirtualMachineBackupCompress(compress),
+		}
+
+		if v := optionalStr(req, "notes_template", ""); v != "" {
+			opts.NotesTemplate = v
+		}
+
+		task, err := node.Vzdump(ctx, opts)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to start backup of %d: %v", vmid, err)), nil
+		}
+		if err := waitForTaskWithTimeout(ctx, task, backupTaskTimeout); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Backup failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Successfully backed up VM/container %d to storage %q on node %q", vmid, storageName, nodeName)), nil
 	}
 }
