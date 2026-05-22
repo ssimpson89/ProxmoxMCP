@@ -1,0 +1,69 @@
+version: 2
+
+project_name: proxmox-mcp
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: proxmox-mcp
+    main: .
+    binary: proxmox-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
+
+  - id: proxmox-mcp-setup
+    main: ./cmd/setup
+    binary: proxmox-mcp-setup
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: ssimpson
+    name: ProxmoxMCP
+  draft: false
+  prerelease: auto
+  name_template: "{{.Tag}}"

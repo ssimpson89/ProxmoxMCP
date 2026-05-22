@@ -1,0 +1,4 @@
+proxmox-mcp
+proxmox-mcp-setup
+dist/
+*.exe
