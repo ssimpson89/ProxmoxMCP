@@ -203,4 +203,4 @@ This builds cross-platform binaries (linux/darwin/windows, amd64/arm64) and crea
 
 ## License
 
-Apache 2.0
+MIT
