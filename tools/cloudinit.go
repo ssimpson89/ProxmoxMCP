@@ -26,7 +26,7 @@ func registerCloudInitTools(s *server.MCPServer, client *px.Client) {
 		mcp.WithString("nameserver", mcp.Description("DNS server IP(s), space-separated")),
 		mcp.WithString("searchdomain", mcp.Description("DNS search domain(s)")),
 		mcp.WithString("citype", mcp.Description("Cloud-init type: nocloud (Linux default), configdrive2 (older), opennebula")),
-		mcp.WithBoolean("ciupgrade", mcp.Description("Auto-upgrade packages on first boot (default: true)")),
+		mcp.WithBoolean("ciupgrade", mcp.Description("Auto-upgrade packages on first boot (default: false — first boot is faster and avoids surprise package changes; pass true to force apt/dnf upgrade)")),
 		mcp.WithString("cicustom", mcp.Description("Custom cloud-init config files: user=STORAGE:snippets/file.yaml,network=...,meta=...")),
 		mcp.WithString("cloudinit_drive", mcp.Description("Attach a cloud-init drive if not already present. Specify as DEVICE=STORAGE (e.g. ide2=local-lvm). Only needed if the VM doesn't already have one.")),
 	), cloudinitSetHandler(client))
@@ -77,17 +77,18 @@ func cloudinitSetHandler(client *px.Client) server.ToolHandlerFunc {
 			})
 		}
 
-		if v, ok := args["ciupgrade"].(bool); ok {
-			val := 1
-			if !v {
-				val = 0
-			}
-			opts = append(opts, px.VirtualMachineOption{Name: "ciupgrade", Value: val})
-		}
-
 		if len(opts) == 0 {
 			return mcp.NewToolResultError("at least one cloud-init parameter must be provided"), nil
 		}
+
+		// Default ciupgrade to 0 (don't auto-upgrade on first boot) unless the
+		// caller explicitly sets it. Proxmox's own default is 1, so we always
+		// send the option to make our default the effective one.
+		ciupgrade := 0
+		if v, ok := args["ciupgrade"].(bool); ok && v {
+			ciupgrade = 1
+		}
+		opts = append(opts, px.VirtualMachineOption{Name: "ciupgrade", Value: ciupgrade})
 
 		task, err := vm.Config(ctx, opts...)
 		if err != nil {

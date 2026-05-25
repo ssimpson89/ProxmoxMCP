@@ -469,7 +469,7 @@ func shellEscape(s string) string {
 
 func claudeCodePath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "settings.json")
+	return filepath.Join(home, ".claude.json")
 }
 
 func claudeDesktopPath() string {

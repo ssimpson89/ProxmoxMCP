@@ -36,6 +36,7 @@ func registerTemplateTools(s *server.MCPServer, client *px.Client) {
 		mcp.WithString("description", mcp.Description("Template description")),
 		mcp.WithString("agent", mcp.Description("QEMU Guest Agent config (default: enabled=1)")),
 		mcp.WithString("scsihw", mcp.Description("SCSI controller type (default: virtio-scsi-pci)")),
+		mcp.WithString("cpu", mcp.Description("CPU type (default: host — gives the guest full host CPU feature visibility for best performance; set to e.g. kvm64 or x86-64-v2-AES if you need cross-CPU live migration)")),
 	), templateCreateHandler(client))
 
 	s.AddTool(mcp.NewTool("template_update_disk",
@@ -160,6 +161,7 @@ func templateCreateHandler(client *px.Client) server.ToolHandlerFunc {
 		netConfig := optionalStr(req, "net", "virtio,bridge=vmbr0")
 		agentConfig := optionalStr(req, "agent", "enabled=1")
 		scsihwConfig := optionalStr(req, "scsihw", "virtio-scsi-pci")
+		cpuConfig := optionalStr(req, "cpu", "host")
 
 		node, err := client.Node(ctx, nodeName)
 		if err != nil {
@@ -177,28 +179,22 @@ func templateCreateHandler(client *px.Client) server.ToolHandlerFunc {
 			}
 		}
 
-		filename := filenameFromURL(imageURL)
-		storage, err := node.Storage(ctx, storageName)
+		importFrom, _, err := downloadImageForImport(ctx, client, node, imageURL, storageName)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to get storage %q: %v", storageName, err)), nil
+			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		dlTask, err := storage.DownloadURL(ctx, "import", filename, imageURL)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to start image download: %v", err)), nil
-		}
-		if err := waitForTask(ctx, dlTask); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Image download failed: %v", err)), nil
-		}
-
-		importVolume := fmt.Sprintf("%s:import/%s", storageName, filename)
+		// Create the template disk on the user-specified storage by importing
+		// from the staged file (size auto-detected via the leading "0").
+		scsi0 := fmt.Sprintf("%s:0,import-from=%s", storageName, importFrom)
 		vmOpts := []px.VirtualMachineOption{
 			{Name: "name", Value: name},
 			{Name: "memory", Value: memory},
 			{Name: "cores", Value: cores},
+			{Name: "cpu", Value: cpuConfig},
 			{Name: "net0", Value: netConfig},
 			{Name: "scsihw", Value: scsihwConfig},
-			{Name: "scsi0", Value: importVolume},
+			{Name: "scsi0", Value: scsi0},
 			{Name: "boot", Value: "order=scsi0"},
 			{Name: "serial0", Value: "socket"},
 			{Name: "agent", Value: agentConfig},
@@ -274,19 +270,11 @@ func templateUpdateDiskHandler(client *px.Client) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to get node %q: %v", nodeName, err)), nil
 		}
 
-		// Step 1: Download the new image
-		filename := filenameFromURL(imageURL)
-		storage, err := node.Storage(ctx, storageName)
+		// Step 1: Download the new image (auto-pick a staging storage that
+		// supports import/iso content; the final disk lives on storageName).
+		importFrom, _, err := downloadImageForImport(ctx, client, node, imageURL, storageName)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to get storage %q: %v", storageName, err)), nil
-		}
-
-		dlTask, err := storage.DownloadURL(ctx, "import", filename, imageURL)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to start image download: %v", err)), nil
-		}
-		if err := waitForTask(ctx, dlTask); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Image download failed: %v", err)), nil
+			return mcp.NewToolResultError(err.Error()), nil
 		}
 
 		// Step 2: Detach old disk
@@ -300,11 +288,11 @@ func templateUpdateDiskHandler(client *px.Client) server.ToolHandlerFunc {
 			}
 		}
 
-		// Step 3: Attach new disk
-		importVolume := fmt.Sprintf("%s:import/%s", storageName, filename)
+		// Step 3: Attach new disk via import-from (creates the disk on storageName).
+		scsi0 := fmt.Sprintf("%s:0,import-from=%s", storageName, importFrom)
 		configTask, err := vm.Config(ctx, px.VirtualMachineOption{
 			Name:  "scsi0",
-			Value: importVolume,
+			Value: scsi0,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to attach new disk: %v", err)), nil
