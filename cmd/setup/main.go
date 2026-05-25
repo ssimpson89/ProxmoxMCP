@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/ssimpson/ProxmoxMCP/config"
 	"github.com/ssimpson/ProxmoxMCP/proxmox"
 )
@@ -48,11 +50,13 @@ func main() {
 	var credFileNames [2]struct{ name, value string }
 
 	if strings.HasPrefix(authMethod, "API") {
-		tokenID = promptRequired(reader, "API Token ID (e.g. user@pam!token-name)")
-		if !strings.Contains(tokenID, "!") {
-			fatal("Token ID must contain '!' (format: user@realm!token-name)")
-		}
-		tokenSecret = promptRequired(reader, "API Token Secret (UUID)")
+		tokenID = promptValidated(reader, "API Token ID (e.g. user@pam!token-name)", func(s string) error {
+			if !strings.Contains(s, "!") {
+				return fmt.Errorf("token ID must contain '!' (format: user@realm!token-name)")
+			}
+			return nil
+		})
+		tokenSecret = promptSecret(reader, "API Token Secret (UUID)")
 		secretLabel = "Token Secret"
 		secretEnvKey = "PROXMOX_TOKEN_SECRET"
 		secretFileEnvKey = "PROXMOX_TOKEN_SECRET_FILE"
@@ -61,11 +65,13 @@ func main() {
 			{"token-secret", tokenSecret},
 		}
 	} else {
-		username = promptRequired(reader, "Username (e.g. root@pam)")
-		if !strings.Contains(username, "@") {
-			fatal("Username must include realm (format: user@realm, e.g. root@pam)")
-		}
-		password = promptRequired(reader, "Password")
+		username = promptValidated(reader, "Username (e.g. root@pam)", func(s string) error {
+			if !strings.Contains(s, "@") {
+				return fmt.Errorf("username must include realm (format: user@realm, e.g. root@pam)")
+			}
+			return nil
+		})
+		password = promptSecret(reader, "Password")
 		secretLabel = "Password"
 		secretEnvKey = "PROXMOX_PASSWORD"
 		secretFileEnvKey = "PROXMOX_PASSWORD_FILE"
@@ -257,6 +263,41 @@ func promptRequired(reader *bufio.Reader, prompt string) string {
 		fmt.Printf("  %s: ", prompt)
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
+		if input != "" {
+			return input
+		}
+		fmt.Println("  (required)")
+	}
+}
+
+func promptValidated(reader *bufio.Reader, prompt string, validate func(string) error) string {
+	for {
+		v := promptRequired(reader, prompt)
+		if err := validate(v); err != nil {
+			fmt.Printf("  %s\n", err)
+			continue
+		}
+		return v
+	}
+}
+
+func promptSecret(reader *bufio.Reader, prompt string) string {
+	fd := int(os.Stdin.Fd())
+	isTTY := term.IsTerminal(fd)
+	for {
+		fmt.Printf("  %s: ", prompt)
+		var input string
+		if isTTY {
+			b, err := term.ReadPassword(fd)
+			fmt.Println()
+			if err != nil {
+				fatal("Failed to read input: %v", err)
+			}
+			input = strings.TrimSpace(string(b))
+		} else {
+			line, _ := reader.ReadString('\n')
+			input = strings.TrimSpace(line)
+		}
 		if input != "" {
 			return input
 		}
