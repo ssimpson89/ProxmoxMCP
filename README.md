@@ -102,56 +102,84 @@ All credential variables support a `_FILE` suffix (e.g., `PROXMOX_TOKEN_SECRET_F
 ### Cluster
 | Tool | Description |
 |---|---|
-| `cluster_status` | Cluster health, quorum, and node membership |
+| `cluster_status` | Get cluster health, quorum status, and node membership |
+| `cluster_resources` | List all resources across the cluster (VMs, containers, storage, nodes). Provides a unified view of resource usage. |
+| `cluster_next_id` | Get the next available VM/container ID in the cluster. Useful for planning new deployments. |
 
 ### Nodes
 | Tool | Description |
 |---|---|
-| `node_list` | List all nodes with CPU, memory, uptime |
-| `node_status` | Detailed node info (kernel, PVE version, load average) |
+| `node_list` | List all nodes in the cluster with status summary (CPU, memory, uptime) |
+| `node_status` | Get detailed status for a specific node including CPU, memory, kernel version, and PVE version |
+| `node_backup` | Create a backup (vzdump) of a VM or container. The backup is stored on the specified storage pool. |
 
 ### QEMU Virtual Machines
 | Tool | Description |
 |---|---|
-| `qemu_list` | List VMs (cluster-wide or per node) |
-| `qemu_status` | Detailed VM config and runtime metrics |
-| `qemu_start` | Start a stopped VM |
-| `qemu_stop` | Force stop a VM |
-| `qemu_shutdown` | ACPI graceful shutdown |
-| `qemu_reboot` | Reboot a running VM |
-| `qemu_reset` | Hard reset (may cause data loss) |
-| `qemu_suspend` | Suspend to RAM |
-| `qemu_resume` | Resume from suspend |
-| `qemu_snapshot_list` | List VM snapshots |
-| `qemu_snapshot_create` | Create a snapshot |
-| `qemu_snapshot_rollback` | Rollback to snapshot (destructive) |
-| `qemu_exec` | Execute command via QEMU Guest Agent |
+| `qemu_list` | List all QEMU virtual machines across the cluster, or on a specific node |
+| `qemu_create_from_url` | Create a new VM (not a template) by downloading a disk image (qcow2/raw) from a URL and importing it. The image is downloaded directly by the Proxmox node. Use this when you want a regular VM from an image URL; use template_create instead if you want a reusable template. |
+| `qemu_status` | Get detailed VM configuration and runtime status |
+| `qemu_start` | Start a stopped virtual machine |
+| `qemu_stop` | Force stop a virtual machine. WARNING: This immediately stops the VM and may cause data loss. Prefer qemu_shutdown for graceful shutdown. |
+| `qemu_shutdown` | Send ACPI shutdown signal to a virtual machine for graceful shutdown |
+| `qemu_reboot` | Reboot a running virtual machine |
+| `qemu_reset` | Hard reset a virtual machine (like pressing the reset button). DESTRUCTIVE: may cause data loss in the guest OS. |
+| `qemu_suspend` | Suspend a virtual machine to RAM (pause CPU execution) |
+| `qemu_resume` | Resume a suspended virtual machine |
+| `qemu_snapshot_list` | List all snapshots for a virtual machine |
+| `qemu_snapshot_create` | Create a new snapshot of a virtual machine |
+| `qemu_snapshot_rollback` | Rollback a virtual machine to a named snapshot. DESTRUCTIVE: current state will be lost. |
+| `qemu_snapshot_delete` | Delete a snapshot from a virtual machine. DESTRUCTIVE: the snapshot data is permanently removed. |
+| `qemu_resize_disk` | Resize a VM disk. Can only increase size, not shrink. Size format: +10G (add 10GB), 50G (set to 50GB). |
+| `qemu_migrate` | Migrate a VM to a different node. Supports online (live) migration and offline migration. |
+| `qemu_agent_info` | Get guest OS information, hostname, and network interfaces from a running VM via the QEMU Guest Agent. Requires the guest agent to be installed and running. |
+| `qemu_exec` | Execute a command inside a VM via the QEMU Guest Agent. Requires the guest agent to be installed and running. Disabled by default; set PROXMOX_ALLOW_EXEC=true to enable. |
 
 ### LXC Containers
 | Tool | Description |
 |---|---|
-| `lxc_list` | List containers (cluster-wide or per node) |
-| `lxc_status` | Detailed container config and metrics |
-| `lxc_start` | Start a stopped container |
-| `lxc_stop` | Force stop a container |
-| `lxc_shutdown` | Graceful shutdown |
-| `lxc_reboot` | Reboot a running container |
-| `lxc_snapshot_list` | List container snapshots |
-| `lxc_snapshot_create` | Create a snapshot |
+| `lxc_list` | List all LXC containers across the cluster, or on a specific node |
+| `lxc_status` | Get detailed LXC container configuration and runtime status |
+| `lxc_start` | Start a stopped LXC container |
+| `lxc_stop` | Force stop an LXC container. WARNING: may cause data loss. Prefer lxc_shutdown for graceful stop. |
+| `lxc_shutdown` | Gracefully shut down an LXC container |
+| `lxc_reboot` | Reboot a running LXC container |
+| `lxc_snapshot_list` | List all snapshots for an LXC container |
+| `lxc_snapshot_create` | Create a new snapshot of an LXC container |
+| `lxc_snapshot_rollback` | Rollback an LXC container to a named snapshot. DESTRUCTIVE: current state will be lost. |
+| `lxc_snapshot_delete` | Delete a snapshot from an LXC container. DESTRUCTIVE: the snapshot data is permanently removed. |
+| `lxc_resize` | Resize an LXC container disk/filesystem. Can only increase size, not shrink. |
+| `lxc_migrate` | Migrate an LXC container to a different node. |
+| `lxc_template_create` | Convert an existing LXC container into a template. The container must be stopped. Once converted, the container cannot be started — it can only be cloned. |
+| `lxc_clone` | Clone an LXC container or container template. Supports full clones (independent copy) and linked clones (shares base image). Linked clones are faster but depend on the source. |
 
 ### Templates
 | Tool | Description |
 |---|---|
-| `template_list` | List VM templates (cluster-wide or per node) |
-| `template_create` | Create a template from a qcow2/raw image URL |
-| `template_update_disk` | Replace a template's disk with a new image (safe for full clones, breaks linked clones) |
-| `template_delete` | Delete a VM template |
+| `template_list` | List all VM templates across the cluster or on a specific node |
+| `template_create` | Create a new VM template by downloading a disk image (qcow2/raw) from a URL and importing it. The image is downloaded directly by the Proxmox node. Safe for both full and linked clone workflows. |
+| `template_update_disk` | Replace an existing VM template's disk with a new image downloaded from a URL. Safe for templates used with full clones (existing full clones are independent copies). DESTRUCTIVE for linked clones: linked clones reference the template's base disk, so replacing it will break them. If you use linked clones, create a new template instead (template_create) and migrate clones to the new template. |
+| `template_delete` | Delete a VM template. DESTRUCTIVE: the template and its disks are permanently removed. |
+| `template_clone` | Clone a new VM from a template. Supports full clones (independent copy) and linked clones (thin-provisioned, shares base disk). Linked clones are faster and use less storage but depend on the template — do not delete the template while linked clones exist. |
+| `template_config_set` | Update configuration on an existing VM template. Accepts any valid QEMU VM configuration key-value pairs. Common keys: bios (seabios|ovmf), ostype (l26|win11|...), vga (std|virtio|qxl|none), machine (q35|i440fx), tags, description, onboot (0|1), agent (enabled=1), protection (0|1), scsihw, boot, cpu, balloon. |
 
 ### Storage
 | Tool | Description |
 |---|---|
-| `storage_list` | List storage pools with capacity info |
-| `storage_content` | List content of a storage pool |
+| `storage_list` | List storage pools, optionally filtered by node. Shows capacity, usage, type, and content types. |
+| `storage_content` | List the content (ISOs, disk images, backups, templates) of a storage pool on a node |
+
+### Cloud-Init
+| Tool | Description |
+|---|---|
+| `cloudinit_set` | Set cloud-init configuration on a VM or template. Cloud-init parameters are applied on first boot of a cloned VM, providing unique identity (hostname, SSH keys, network config). A cloud-init drive must be attached to the VM (use cloudinit_drive parameter or add one with template_config_set: {\"ide2\": \"local-lvm:cloudinit\"}). |
+| `cloudinit_get` | Read cloud-init configuration from a VM or template. Returns current cloud-init parameters (user, IP config, nameserver, etc.). SSH keys and passwords are redacted. |
+
+### Appliances
+| Tool | Description |
+|---|---|
+| `appliance_list` | List available appliance templates from the Proxmox catalog. These are pre-built LXC container templates (TurnKey Linux, system images, etc.) that can be downloaded to storage and used to create containers. |
+| `appliance_download` | Download an appliance template from the Proxmox catalog to local storage. Use appliance_list to find available templates. The template name is the 'template' field from appliance_list (e.g. 'ubuntu-24.04-standard_24.04-2_amd64.tar.zst'). |
 
 ## Building from Source
 

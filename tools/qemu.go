@@ -19,6 +19,28 @@ func registerQemuTools(s *server.MCPServer, client *px.Client, cfg *config.Confi
 		mcp.WithString("node", mcp.Description("Filter by node name (optional, lists all nodes if omitted)")),
 	), qemuListHandler(client))
 
+	s.AddTool(mcp.NewTool("qemu_create_from_url",
+		mcp.WithDescription("Create a new VM (not a template) by downloading a disk image (qcow2/raw) from a URL and importing it. The image is downloaded directly by the Proxmox node. Use this when you want a regular VM from an image URL; use template_create instead if you want a reusable template."),
+		mcp.WithString("node", mcp.Required(), mcp.Description("Node to create the VM on")),
+		mcp.WithString("name", mcp.Required(), mcp.Description("VM name (e.g. webserver-01)")),
+		mcp.WithString("url", mcp.Required(), mcp.Description("URL to a qcow2 or raw disk image")),
+		mcp.WithString("storage", mcp.Required(), mcp.Description("Storage pool for the disk (e.g. local-lvm, ceph-pool)")),
+		mcp.WithNumber("vmid", mcp.Description("VM ID (optional, auto-assigned if omitted)")),
+		mcp.WithNumber("memory", mcp.Description("Memory in MB (default: 2048)")),
+		mcp.WithNumber("cores", mcp.Description("CPU cores (default: 2)")),
+		mcp.WithString("net", mcp.Description("Network config (default: virtio,bridge=vmbr0)")),
+		mcp.WithString("bios", mcp.Description("Firmware type: seabios (default) or ovmf (UEFI)")),
+		mcp.WithString("ostype", mcp.Description("Guest OS type: l26 (Linux 2.6+), win11, win10, etc.")),
+		mcp.WithString("vga", mcp.Description("VGA type: std, virtio, qxl, serial0, none")),
+		mcp.WithString("machine", mcp.Description("Machine type: q35 or i440fx")),
+		mcp.WithString("tags", mcp.Description("Semicolon-separated tags (e.g. linux;production)")),
+		mcp.WithString("description", mcp.Description("VM description")),
+		mcp.WithString("agent", mcp.Description("QEMU Guest Agent config (default: enabled=1)")),
+		mcp.WithString("scsihw", mcp.Description("SCSI controller type (default: virtio-scsi-pci)")),
+		mcp.WithString("disk_size", mcp.Description("Resize the imported disk after import (e.g. +10G to grow by 10GB, 50G to set to 50GB)")),
+		mcp.WithBoolean("start", mcp.Description("Start the VM after creation (default: false)")),
+	), qemuCreateFromURLHandler(client))
+
 	s.AddTool(mcp.NewTool("qemu_status",
 		mcp.WithDescription("Get detailed VM configuration and runtime status"),
 		mcp.WithString("node", mcp.Required(), mcp.Description("Node name")),
@@ -496,6 +518,146 @@ func qemuMigrateHandler(client *px.Client) server.ToolHandlerFunc {
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Successfully migrated VM %d to node %s", vmid, target)), nil
+	}
+}
+
+func qemuCreateFromURLHandler(client *px.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeName, err := requiredNode(req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		name, err := req.RequireString("name")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		imageURL, err := req.RequireString("url")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		storageName, err := requiredStorageName(req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		vmid, _ := optionalInt(req, "vmid")
+		memory := optionalIntDefault(req, "memory", 2048)
+		cores := optionalIntDefault(req, "cores", 2)
+
+		netConfig := optionalStr(req, "net", "virtio,bridge=vmbr0")
+		agentConfig := optionalStr(req, "agent", "enabled=1")
+		scsihwConfig := optionalStr(req, "scsihw", "virtio-scsi-pci")
+		diskSize := optionalStr(req, "disk_size", "")
+		if diskSize != "" && !diskSizeRe.MatchString(diskSize) {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid disk_size %q: must be like +10G, 50G, 100M", diskSize)), nil
+		}
+
+		startVM := false
+		if v, ok := req.GetArguments()["start"].(bool); ok {
+			startVM = v
+		}
+
+		node, err := client.Node(ctx, nodeName)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to get node %q: %v", nodeName, err)), nil
+		}
+
+		if vmid == 0 {
+			cluster, err := client.Cluster(ctx)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Failed to get cluster: %v", err)), nil
+			}
+			vmid, err = cluster.NextID(ctx)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Failed to get next VM ID: %v", err)), nil
+			}
+		}
+
+		filename := filenameFromURL(imageURL)
+		storage, err := node.Storage(ctx, storageName)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to get storage %q: %v", storageName, err)), nil
+		}
+
+		dlTask, err := storage.DownloadURL(ctx, "import", filename, imageURL)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to start image download: %v", err)), nil
+		}
+		if err := waitForTask(ctx, dlTask); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Image download failed: %v", err)), nil
+		}
+
+		importVolume := fmt.Sprintf("%s:import/%s", storageName, filename)
+		vmOpts := []px.VirtualMachineOption{
+			{Name: "name", Value: name},
+			{Name: "memory", Value: memory},
+			{Name: "cores", Value: cores},
+			{Name: "net0", Value: netConfig},
+			{Name: "scsihw", Value: scsihwConfig},
+			{Name: "scsi0", Value: importVolume},
+			{Name: "boot", Value: "order=scsi0"},
+			{Name: "serial0", Value: "socket"},
+			{Name: "agent", Value: agentConfig},
+		}
+
+		for _, key := range []string{"bios", "ostype", "vga", "machine", "tags", "description"} {
+			if v := optionalStr(req, key, ""); v != "" {
+				vmOpts = append(vmOpts, px.VirtualMachineOption{Name: key, Value: v})
+			}
+		}
+
+		createTask, err := node.NewVirtualMachine(ctx, vmid, vmOpts...)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to create VM: %v", err)), nil
+		}
+		if err := waitForTask(ctx, createTask); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("VM creation failed: %v", err)), nil
+		}
+
+		vm, err := node.VirtualMachine(ctx, vmid)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to get VM %d after creation: %v", vmid, err)), nil
+		}
+
+		if diskSize != "" {
+			resizeTask, err := vm.ResizeDisk(ctx, "scsi0", diskSize)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Failed to resize disk on VM %d: %v", vmid, err)), nil
+			}
+			if err := waitForTask(ctx, resizeTask); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Disk resize failed: %v", err)), nil
+			}
+		}
+
+		started := false
+		if startVM {
+			startTask, err := vm.Start(ctx)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("VM %d created but failed to start: %v", vmid, err)), nil
+			}
+			if err := waitForTask(ctx, startTask); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("VM %d created but start task failed: %v", vmid, err)), nil
+			}
+			started = true
+		}
+
+		result := struct {
+			VMID    int    `json:"vmid"`
+			Name    string `json:"name"`
+			Node    string `json:"node"`
+			Storage string `json:"storage"`
+			Started bool   `json:"started"`
+			Message string `json:"message"`
+		}{
+			VMID:    vmid,
+			Name:    name,
+			Node:    nodeName,
+			Storage: storageName,
+			Started: started,
+			Message: fmt.Sprintf("VM %q created successfully as VM %d", name, vmid),
+		}
+
+		return marshalResult(result)
 	}
 }
 
